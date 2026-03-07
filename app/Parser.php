@@ -27,6 +27,8 @@ final class Parser
     private static ?array $dateCache = null;
     private static ?array $dayLabels = null;
     private static ?array $dayJsonPrefixes = null;
+    private static ?array $outputDaySlots = null;
+    private static ?array $outputDayPrefixes = null;
     private static ?array $countBaseOffsetsByte = null;
     private static ?array $countBaseOffsetsWord = null;
     private static int $activeDayCount = self::DAY_RANGE;
@@ -45,6 +47,10 @@ final class Parser
 
     public function parse(string $inputPath, string $outputPath): void
     {
+        if (function_exists('gc_disable')) {
+            gc_disable();
+        }
+
         $fileSize = filesize($inputPath);
 
         if ($fileSize === false) {
@@ -91,6 +97,8 @@ final class Parser
         self::$dateCache = [];
         self::$dayLabels = [];
         self::$dayJsonPrefixes = [];
+        self::$outputDaySlots = [];
+        self::$outputDayPrefixes = [];
         self::$countBaseOffsetsByte = [];
         self::$countBaseOffsetsWord = [];
         $groups = [];
@@ -447,7 +455,6 @@ final class Parser
         $remainingUris = count(self::$uris);
         $shouldCompactDays = $this->shouldUseCompactDayDomain();
         $shouldUseBandedDays = $this->shouldUseBandedDayDomain();
-        $shouldCollectDayDomain = $shouldCompactDays || $shouldUseBandedDays;
         $seenTimestamps = [];
         $uniqueTimestampCount = 0;
         $daySet = [];
@@ -471,7 +478,7 @@ final class Parser
                 }
             }
 
-            if ($shouldCollectDayDomain && $uniqueTimestampCount < self::DATE_POOL_SIZE) {
+            if ($uniqueTimestampCount < self::DATE_POOL_SIZE) {
                 $timestamp = substr($line, $comma + 1, 25);
 
                 if (! isset($seenTimestamps[$timestamp])) {
@@ -488,19 +495,23 @@ final class Parser
                 }
             }
 
-            if ($remainingUris === 0 && (! $shouldCollectDayDomain || $uniqueTimestampCount === self::DATE_POOL_SIZE)) {
+            if ($remainingUris === 0 && $uniqueTimestampCount === self::DATE_POOL_SIZE) {
                 break;
             }
         }
 
         fclose($handle);
 
-        if ($shouldCollectDayDomain && $daySet !== []) {
+        if ($daySet !== []) {
             if ($shouldUseBandedDays) {
                 self::configureBandedDayDomain($minDayCode, $maxDayCode);
-            } else {
+            } elseif ($shouldCompactDays) {
                 ksort($daySet, SORT_NUMERIC);
                 self::configureDayDomain(array_keys($daySet));
+            } else {
+                self::configureFullDayDomain();
+                ksort($daySet, SORT_NUMERIC);
+                self::configureOutputDayDomain(array_keys($daySet));
             }
         } else {
             self::configureFullDayDomain();
@@ -518,12 +529,16 @@ final class Parser
         self::$useDayMajorLayout = false;
         self::$dayLabels = [];
         self::$dayJsonPrefixes = [];
+        self::$outputDaySlots = [];
+        self::$outputDayPrefixes = [];
         self::$countBaseOffsetsByte = array_fill(0, self::DAY_RANGE, 0);
         self::$countBaseOffsetsWord = array_fill(0, self::DAY_RANGE, 0);
 
         for ($dayCode = 0; $dayCode < self::DAY_RANGE; $dayCode++) {
             self::$dayLabels[$dayCode] = self::formatDayCode($dayCode);
             self::$dayJsonPrefixes[$dayCode] = '        "' . self::$dayLabels[$dayCode] . '": ';
+            self::$outputDaySlots[$dayCode] = $dayCode;
+            self::$outputDayPrefixes[$dayCode] = self::$dayJsonPrefixes[$dayCode];
             self::$countBaseOffsetsByte[$dayCode] = $dayCode * $uriCount;
             self::$countBaseOffsetsWord[$dayCode] = ($dayCode * $uriCount) << 1;
         }
@@ -538,12 +553,15 @@ final class Parser
         self::$useDayMajorLayout = true;
         self::$dayLabels = array_fill(0, self::$activeDayCount, '');
         self::$dayJsonPrefixes = array_fill(0, self::$activeDayCount, '');
+        self::$outputDaySlots = range(0, self::$activeDayCount - 1);
+        self::$outputDayPrefixes = array_fill(0, self::$activeDayCount, '');
         self::$countBaseOffsetsByte = array_fill(0, self::DAY_RANGE, -1);
         self::$countBaseOffsetsWord = array_fill(0, self::DAY_RANGE, -1);
 
         foreach ($dayCodes as $dayIndex => $dayCode) {
             self::$dayLabels[$dayIndex] = self::formatDayCode($dayCode);
             self::$dayJsonPrefixes[$dayIndex] = '        "' . self::$dayLabels[$dayIndex] . '": ';
+            self::$outputDayPrefixes[$dayIndex] = self::$dayJsonPrefixes[$dayIndex];
             self::$countBaseOffsetsByte[$dayCode] = $dayIndex * $uriCount;
             self::$countBaseOffsetsWord[$dayCode] = ($dayIndex * $uriCount) << 1;
         }
@@ -557,12 +575,26 @@ final class Parser
         self::$useDayMajorLayout = false;
         self::$dayLabels = array_fill(0, self::$activeDayCount, '');
         self::$dayJsonPrefixes = array_fill(0, self::$activeDayCount, '');
+        self::$outputDaySlots = range(0, self::$activeDayCount - 1);
+        self::$outputDayPrefixes = array_fill(0, self::$activeDayCount, '');
         self::$countBaseOffsetsByte = [];
         self::$countBaseOffsetsWord = [];
 
         for ($dayIndex = 0, $dayCode = $minDayCode; $dayCode <= $maxDayCode; $dayCode++, $dayIndex++) {
             self::$dayLabels[$dayIndex] = self::formatDayCode($dayCode);
             self::$dayJsonPrefixes[$dayIndex] = '        "' . self::$dayLabels[$dayIndex] . '": ';
+            self::$outputDayPrefixes[$dayIndex] = self::$dayJsonPrefixes[$dayIndex];
+        }
+    }
+
+    private static function configureOutputDayDomain(array $dayCodes): void
+    {
+        self::$outputDaySlots = [];
+        self::$outputDayPrefixes = [];
+
+        foreach ($dayCodes as $outputIndex => $dayCode) {
+            self::$outputDaySlots[$outputIndex] = $dayCode;
+            self::$outputDayPrefixes[$outputIndex] = self::$dayJsonPrefixes[$dayCode];
         }
     }
 
@@ -1412,8 +1444,9 @@ final class Parser
 
     private function buildOutputFromArrayCounts(array $counts, array $orderedUris): string
     {
-        $dayJsonPrefixes = self::$dayJsonPrefixes;
-        $dayCount = self::$activeDayCount;
+        $outputDayPrefixes = self::$outputDayPrefixes;
+        $outputDaySlots = self::$outputDaySlots;
+        $outputDayCount = count($outputDayPrefixes);
         $useDayMajorLayout = self::$useDayMajorLayout;
         $uriCount = count(self::$uris);
         $buffer = "{\n";
@@ -1423,18 +1456,37 @@ final class Parser
             $buffer .= self::$uriJsonOpeners[$uriIndex];
             $hasVisit = false;
 
-            $slot = $useDayMajorLayout ? $uriIndex : ($uriIndex * $dayCount);
+            if ($useDayMajorLayout) {
+                $slot = $uriIndex;
 
-            for ($dayIndex = 0; $dayIndex < $dayCount; $dayIndex++, $slot += $useDayMajorLayout ? $uriCount : 1) {
-                $count = $counts[$slot];
+                for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
+                    $count = $counts[$slot];
 
-                if ($count !== 0) {
-                    if ($hasVisit) {
-                        $buffer .= ",\n";
+                    if ($count !== 0) {
+                        if ($hasVisit) {
+                            $buffer .= ",\n";
+                        }
+
+                        $buffer .= $outputDayPrefixes[$dayIndex] . $count;
+                        $hasVisit = true;
                     }
 
-                    $buffer .= $dayJsonPrefixes[$dayIndex] . $count;
-                    $hasVisit = true;
+                    $slot += $uriCount;
+                }
+            } else {
+                $slotBase = $uriIndex * self::$activeDayCount;
+
+                for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
+                    $count = $counts[$slotBase + $outputDaySlots[$dayIndex]];
+
+                    if ($count !== 0) {
+                        if ($hasVisit) {
+                            $buffer .= ",\n";
+                        }
+
+                        $buffer .= $outputDayPrefixes[$dayIndex] . $count;
+                        $hasVisit = true;
+                    }
                 }
             }
 
@@ -1452,8 +1504,9 @@ final class Parser
 
     private function buildOutputFromByteCounts(string $counts, array $orderedUris): string
     {
-        $dayJsonPrefixes = self::$dayJsonPrefixes;
-        $dayCount = self::$activeDayCount;
+        $outputDayPrefixes = self::$outputDayPrefixes;
+        $outputDaySlots = self::$outputDaySlots;
+        $outputDayCount = count($outputDayPrefixes);
         $useDayMajorLayout = self::$useDayMajorLayout;
         $uriCount = count(self::$uris);
         $buffer = "{\n";
@@ -1463,18 +1516,37 @@ final class Parser
             $buffer .= self::$uriJsonOpeners[$uriIndex];
             $hasVisit = false;
 
-            $slot = $useDayMajorLayout ? $uriIndex : ($uriIndex * $dayCount);
+            if ($useDayMajorLayout) {
+                $slot = $uriIndex;
 
-            for ($dayIndex = 0; $dayIndex < $dayCount; $dayIndex++, $slot += $useDayMajorLayout ? $uriCount : 1) {
-                $countByte = $counts[$slot];
+                for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
+                    $countByte = $counts[$slot];
 
-                if ($countByte !== "\0") {
-                    if ($hasVisit) {
-                        $buffer .= ",\n";
+                    if ($countByte !== "\0") {
+                        if ($hasVisit) {
+                            $buffer .= ",\n";
+                        }
+
+                        $buffer .= $outputDayPrefixes[$dayIndex] . ord($countByte);
+                        $hasVisit = true;
                     }
 
-                    $buffer .= $dayJsonPrefixes[$dayIndex] . ord($countByte);
-                    $hasVisit = true;
+                    $slot += $uriCount;
+                }
+            } else {
+                $slotBase = $uriIndex * self::$activeDayCount;
+
+                for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
+                    $countByte = $counts[$slotBase + $outputDaySlots[$dayIndex]];
+
+                    if ($countByte !== "\0") {
+                        if ($hasVisit) {
+                            $buffer .= ",\n";
+                        }
+
+                        $buffer .= $outputDayPrefixes[$dayIndex] . ord($countByte);
+                        $hasVisit = true;
+                    }
                 }
             }
 
@@ -1492,8 +1564,9 @@ final class Parser
 
     private function buildOutputFromWordCounts(string $counts, array $orderedUris): string
     {
-        $dayJsonPrefixes = self::$dayJsonPrefixes;
-        $dayCount = self::$activeDayCount;
+        $outputDayPrefixes = self::$outputDayPrefixes;
+        $outputDaySlots = self::$outputDaySlots;
+        $outputDayCount = count($outputDayPrefixes);
         $useDayMajorLayout = self::$useDayMajorLayout;
         $uriCount = count(self::$uris);
         $slotStride = $useDayMajorLayout ? ($uriCount << 1) : 2;
@@ -1504,19 +1577,40 @@ final class Parser
             $buffer .= self::$uriJsonOpeners[$uriIndex];
             $hasVisit = false;
 
-            $slot = $useDayMajorLayout ? ($uriIndex << 1) : (($uriIndex * $dayCount) << 1);
+            if ($useDayMajorLayout) {
+                $slot = $uriIndex << 1;
 
-            for ($dayIndex = 0; $dayIndex < $dayCount; $dayIndex++, $slot += $slotStride) {
-                $lowByte = ord($counts[$slot]);
-                $highByte = ord($counts[$slot + 1]);
+                for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
+                    $lowByte = ord($counts[$slot]);
+                    $highByte = ord($counts[$slot + 1]);
 
-                if (($lowByte | $highByte) !== 0) {
-                    if ($hasVisit) {
-                        $buffer .= ",\n";
+                    if (($lowByte | $highByte) !== 0) {
+                        if ($hasVisit) {
+                            $buffer .= ",\n";
+                        }
+
+                        $buffer .= $outputDayPrefixes[$dayIndex] . ($lowByte | ($highByte << 8));
+                        $hasVisit = true;
                     }
 
-                    $buffer .= $dayJsonPrefixes[$dayIndex] . ($lowByte | ($highByte << 8));
-                    $hasVisit = true;
+                    $slot += $slotStride;
+                }
+            } else {
+                $slotBase = $uriIndex * self::$activeDayCount;
+
+                for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
+                    $slot = ($slotBase + $outputDaySlots[$dayIndex]) << 1;
+                    $lowByte = ord($counts[$slot]);
+                    $highByte = ord($counts[$slot + 1]);
+
+                    if (($lowByte | $highByte) !== 0) {
+                        if ($hasVisit) {
+                            $buffer .= ",\n";
+                        }
+
+                        $buffer .= $outputDayPrefixes[$dayIndex] . ($lowByte | ($highByte << 8));
+                        $hasVisit = true;
+                    }
                 }
             }
 

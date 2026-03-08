@@ -272,48 +272,11 @@ final class ReconstructionAttempt
     }
 
     /**
-     * @param list<int> $seeds
-     * @param list<array{0:int,1:int}> $ranges
-     * @return list<string>
-     */
-    public function validateReplica(array $seeds, array $ranges, int $samplesPerRange = 64): array
-    {
-        $mismatches = [];
-
-        foreach ($seeds as $seed) {
-            foreach ($ranges as [$min, $max]) {
-                $native = new Randomizer(new Xoshiro256StarStar($seed));
-                $replica = RandomizerReplica::fromSeed($seed);
-
-                for ($sample = 0; $sample < $samplesPerRange; $sample++) {
-                    $expected = $native->getInt($min, $max);
-                    $actual = $replica->getInt($min, $max);
-
-                    if ($expected !== $actual) {
-                        $mismatches[] = sprintf(
-                            'seed=%d range=%d..%d sample=%d expected=%d actual=%d',
-                            $seed,
-                            $min,
-                            $max,
-                            $sample,
-                            $expected,
-                            $actual,
-                        );
-                        break 2;
-                    }
-                }
-            }
-        }
-
-        return $mismatches;
-    }
-
-    /**
-     * @return array{0:NativeRandomizer,1:list<string>,2:list<int>}
+     * @return array{0:Randomizer,1:list<string>,2:list<int>}
      */
     private function buildExecutionContext(int $seed): array
     {
-        $randomizer = NativeRandomizer::fromSeed($seed);
+        $randomizer = new Randomizer(new Xoshiro256StarStar($seed));
         $datePoolStrings = [];
         $datePoolDayCodes = [];
 

@@ -42,15 +42,11 @@ if (($argv[1] ?? null) === 'data:parse') {
     }
 
     require_once __DIR__ . '/app/Commands/Visit.php';
-    require_once __DIR__ . '/app/Reconstruction/Xoshiro256StarStarReplica.php';
-    require_once __DIR__ . '/app/Reconstruction/RandomizerReplica.php';
-    require_once __DIR__ . '/app/Reconstruction/NativeRandomizer.php';
     require_once __DIR__ . '/app/Reconstruction/PrefixScanResult.php';
     require_once __DIR__ . '/app/Reconstruction/ReconstructionResult.php';
     require_once __DIR__ . '/app/Reconstruction/ApproximateWindowVerifier.php';
     require_once __DIR__ . '/app/Reconstruction/PrecomputedReconstructionStates.php';
     require_once __DIR__ . '/app/Reconstruction/ReconstructionAttempt.php';
-    require_once __DIR__ . '/app/Reconstruction/FeasibilityHarness.php';
     require_once __DIR__ . '/app/Parser.php';
 
     (new App\Parser())->parse($inputPath, $outputPath);

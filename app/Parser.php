@@ -891,52 +891,6 @@ final class Parser
         return $dayCodes;
     }
 
-    private function resolveOutputDayCodesFromCounts(array|string $counts, bool $useByteCounts): array
-    {
-        $dayCodes = [];
-        $uriCount = count(self::$uris);
-        $dayCount = self::$activeDayCount;
-
-        if (is_string($counts)) {
-            if ($useByteCounts) {
-                for ($dayCode = 0; $dayCode < $dayCount; $dayCode++) {
-                    for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
-                        if ($counts[($uriIndex * $dayCount) + $dayCode] !== "\0") {
-                            $dayCodes[] = $dayCode;
-                            break;
-                        }
-                    }
-                }
-
-                return $dayCodes;
-            }
-
-            for ($dayCode = 0; $dayCode < $dayCount; $dayCode++) {
-                for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
-                    $slot = (($uriIndex * $dayCount) + $dayCode) << 1;
-
-                    if (($counts[$slot] !== "\0") || ($counts[$slot + 1] !== "\0")) {
-                        $dayCodes[] = $dayCode;
-                        break;
-                    }
-                }
-            }
-
-            return $dayCodes;
-        }
-
-        for ($dayCode = 0; $dayCode < $dayCount; $dayCode++) {
-            for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
-                if ($counts[($uriIndex * $dayCount) + $dayCode] !== 0) {
-                    $dayCodes[] = $dayCode;
-                    break;
-                }
-            }
-        }
-
-        return $dayCodes;
-    }
-
     private static function dayCodeFromDateString(string $dayLabel): int
     {
         return (((int) substr($dayLabel, 2, 2) - 20) << 9)
@@ -954,153 +908,6 @@ final class Parser
         self::$uncachedCountOnlyChunkProcessor = null;
         self::$cachedByteCountOnlyChunkProcessor = null;
         self::$uncachedByteCountOnlyChunkProcessor = null;
-    }
-
-    private function parseInParallel(
-        string $inputPath,
-        string $outputPath,
-        int $fileSize,
-        int $workerCount,
-        bool $useByteCounts,
-    ): array
-    {
-        $profile = $this->shouldInternalProfile();
-        $profileStart = $profile ? microtime(true) : 0.0;
-        $ranges = $this->resolveRanges($inputPath, $fileSize, $workerCount);
-        $rangesResolvedAt = $profile ? microtime(true) : 0.0;
-
-        if (count($ranges) === 1) {
-            return $this->parseRange($inputPath, 0, $fileSize, $useByteCounts);
-        }
-
-        if ($this->shouldUseSocketTransport()) {
-            return $this->parseInParallelWithSockets(
-                $inputPath,
-                $fileSize,
-                $ranges,
-                $useByteCounts,
-                $profile,
-                $profileStart,
-                $rangesResolvedAt,
-            );
-        }
-
-        $tempDir = dirname($outputPath) . '/.parser-tmp-' . md5($outputPath . ':' . getmypid() . ':' . microtime(true));
-
-        if (! is_dir($tempDir) && ! mkdir($tempDir, 0777, true) && ! is_dir($tempDir)) {
-            throw new RuntimeException("Unable to create {$tempDir}");
-        }
-
-        $children = [];
-        $status = 0;
-        $uriCount = count(self::$uris);
-        $slotCount = $uriCount * self::$activeDayCount;
-        $useSodiumMerge = ! $useByteCounts
-            && function_exists('sodium_add')
-            && getenv('PARSER_DISABLE_SODIUM_MERGE') === false;
-        $counts = $useSodiumMerge ? null : array_fill(0, $slotCount, 0);
-        $firstSeen = array_fill(0, $uriCount, -1);
-
-        foreach ($ranges as $workerIndex => [$start, $end]) {
-            $resultPath = "{$tempDir}/worker-{$workerIndex}.bin";
-
-            if (is_file($resultPath)) {
-                unlink($resultPath);
-            }
-
-            $pid = pcntl_fork();
-
-            if ($pid === -1) {
-                throw new RuntimeException('Unable to fork worker');
-            }
-
-            if ($pid === 0) {
-                [$counts, $firstSeen] = $this->parseRange($inputPath, $start, $end, $useByteCounts);
-                $this->writeWorkerResult($resultPath, $counts, $firstSeen);
-                exit(0);
-            }
-
-            $children[$pid] = [$workerIndex, $resultPath];
-        }
-
-        while ($children !== []) {
-            $pid = pcntl_wait($status);
-
-            if ($pid <= 0) {
-                break;
-            }
-
-            if (! isset($children[$pid])) {
-                continue;
-            }
-
-            if (! pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
-                throw new RuntimeException("Worker {$pid} failed");
-            }
-
-            [$workerIndex, $resultPath] = $children[$pid];
-            [$workerCounts, $workerSeen] = $this->readWorkerResult(
-                $resultPath,
-                $slotCount,
-                $uriCount,
-                $useSodiumMerge || $useByteCounts,
-                $useByteCounts,
-            );
-
-            if ($useSodiumMerge) {
-                if ($counts === null) {
-                    $counts = $workerCounts;
-                } else {
-                    sodium_add($counts, $workerCounts);
-                }
-            } else {
-                if ($useByteCounts) {
-                    for ($slot = 0; $slot < $slotCount; $slot++) {
-                        $counts[$slot] += ord($workerCounts[$slot]);
-                    }
-                } else {
-                    for ($slot = 0; $slot < $slotCount; $slot++) {
-                        $counts[$slot] += $workerCounts[$slot];
-                    }
-                }
-            }
-
-            $workerPrefix = $workerIndex << 32;
-
-            for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
-                if ($workerSeen[$uriIndex] === -1) {
-                    continue;
-                }
-
-                $seen = ($workerIndex << 32) | $workerSeen[$uriIndex];
-
-                if ($firstSeen[$uriIndex] === -1 || $seen < $firstSeen[$uriIndex]) {
-                    $firstSeen[$uriIndex] = $seen;
-                }
-            }
-
-            if (is_file($resultPath)) {
-                unlink($resultPath);
-            }
-
-            unset($children[$pid]);
-        }
-        $workersFinishedAt = $profile ? microtime(true) : 0.0;
-
-        @rmdir($tempDir);
-
-        if ($profile) {
-            $mergeFinishedAt = microtime(true);
-            fwrite(STDERR, sprintf(
-                "profile ranges=%.6f wait=%.6f merge=%.6f total=%.6f\n",
-                $rangesResolvedAt - $profileStart,
-                $workersFinishedAt - $rangesResolvedAt,
-                $mergeFinishedAt - $workersFinishedAt,
-                $mergeFinishedAt - $profileStart,
-            ));
-        }
-
-        return [$counts ?? str_repeat("\0", $slotCount * 2), $firstSeen];
     }
 
     /**
@@ -1237,121 +1044,6 @@ final class Parser
             'counts' => $counts ?? str_repeat("\0", $slotCount * 2),
             'active_days' => $activeDayBitmap,
         ];
-    }
-
-    private function parseInParallelWithSockets(
-        string $inputPath,
-        int $fileSize,
-        array $ranges,
-        bool $useByteCounts,
-        bool $profile,
-        float $profileStart,
-        float $rangesResolvedAt,
-    ): array
-    {
-        $uriCount = count(self::$uris);
-        $slotCount = $uriCount * self::$activeDayCount;
-        $payloadSize = $this->resolveWorkerPayloadSize($slotCount, $uriCount, $useByteCounts);
-        $useSodiumMerge = ! $useByteCounts
-            && function_exists('sodium_add')
-            && getenv('PARSER_DISABLE_SODIUM_MERGE') === false;
-        $counts = $useSodiumMerge ? null : array_fill(0, $slotCount, 0);
-        $firstSeen = array_fill(0, $uriCount, -1);
-        $children = [];
-        $status = 0;
-
-        foreach ($ranges as $workerIndex => [$start, $end]) {
-            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-
-            if ($pair === false) {
-                throw new RuntimeException('Unable to create worker socket pair');
-            }
-
-            [$parentStream, $childStream] = $pair;
-            $this->tuneWorkerSocketStream($parentStream, $payloadSize, SO_RCVBUF);
-            $this->tuneWorkerSocketStream($childStream, $payloadSize, SO_SNDBUF);
-            @stream_set_chunk_size($parentStream, $payloadSize);
-            @stream_set_chunk_size($childStream, $payloadSize);
-            stream_set_blocking($parentStream, false);
-            $pid = pcntl_fork();
-
-            if ($pid === -1) {
-                fclose($parentStream);
-                fclose($childStream);
-                throw new RuntimeException('Unable to fork worker');
-            }
-
-            if ($pid === 0) {
-                fclose($parentStream);
-                [$workerCounts, $workerSeen] = $this->parseRange($inputPath, $start, $end, $useByteCounts);
-                $this->writeWorkerStream($childStream, $workerCounts, $workerSeen);
-                fclose($childStream);
-                exit(0);
-            }
-
-            fclose($childStream);
-            $children[$pid] = [
-                'workerIndex' => $workerIndex,
-                'stream' => $parentStream,
-            ];
-        }
-
-        while ($children !== []) {
-            $pid = pcntl_wait($status);
-
-            if ($pid <= 0) {
-                break;
-            }
-
-            if (! isset($children[$pid])) {
-                continue;
-            }
-
-            if (! pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
-                throw new RuntimeException("Worker {$pid} failed");
-            }
-
-            $stream = $children[$pid]['stream'];
-            $raw = stream_get_contents($stream);
-            fclose($stream);
-
-            if ($raw === false) {
-                throw new RuntimeException('Unable to read worker payload');
-            }
-
-            [$workerCounts, $workerSeen] = $this->decodeWorkerResult(
-                $raw,
-                $slotCount,
-                $uriCount,
-                $useSodiumMerge || $useByteCounts,
-                $useByteCounts,
-            );
-            $this->mergeWorkerResult(
-                $counts,
-                $firstSeen,
-                $workerCounts,
-                $workerSeen,
-                $children[$pid]['workerIndex'],
-                $slotCount,
-                $uriCount,
-                $useSodiumMerge,
-                $useByteCounts,
-            );
-            unset($children[$pid]);
-        }
-
-        if ($profile) {
-            $finishedAt = microtime(true);
-            fwrite(STDERR, sprintf(
-                "profile ranges=%.6f wait=%.6f merge=%.6f total=%.6f\n",
-                $rangesResolvedAt - $profileStart,
-                $finishedAt - $rangesResolvedAt,
-                0.0,
-                $finishedAt - $profileStart,
-            ));
-        }
-
-        return [$counts ?? str_repeat("\0", $slotCount * 2), $firstSeen];
     }
 
     private function parseInParallelCountsOnlyWithShmop(
@@ -1649,75 +1341,6 @@ final class Parser
         return $ranges;
     }
 
-    private function parseRange(string $inputPath, int $start, int $end, bool $useByteCounts): array
-    {
-        $chunkProcessor = self::resolveChunkProcessor(
-            trackFirstSeen: true,
-            useDateCache: $this->shouldUseDateCache(),
-            useByteCounts: $useByteCounts,
-        );
-        $uriCount = count(self::$uris);
-        $readSize = $this->resolveReadSize();
-        $slotCount = $uriCount * self::$activeDayCount;
-        $counts = str_repeat("\0", $useByteCounts ? $slotCount : $slotCount * 2);
-        $firstSeen = array_fill(0, $uriCount, -1);
-        $handle = fopen($inputPath, 'rb');
-
-        if ($handle === false) {
-            throw new RuntimeException("Unable to open {$inputPath}");
-        }
-
-        stream_set_read_buffer($handle, 0);
-        fseek($handle, $start);
-
-        $carry = '';
-        $parsedDateCache = [];
-        $remainingFirstSeen = $uriCount;
-        $sequence = 0;
-        $position = $start;
-
-        while ($position < $end) {
-            $remaining = $end - $position;
-            $buffer = fread($handle, $remaining > $readSize ? $readSize : $remaining);
-
-            if ($buffer === false || $buffer === '') {
-                break;
-            }
-
-            $position += strlen($buffer);
-
-            if ($carry !== '') {
-                $buffer = $carry . $buffer;
-                $carry = '';
-            }
-
-            if ($position < $end) {
-                $lastNewline = strrpos($buffer, "\n");
-
-                if ($lastNewline === false) {
-                    $carry = $buffer;
-                    continue;
-                }
-
-                $carry = substr($buffer, $lastNewline + 1);
-                $limit = $lastNewline + 1;
-            } else {
-                $limit = strlen($buffer);
-            }
-
-            $chunkProcessor($buffer, $limit, $counts, $firstSeen, $parsedDateCache, $remainingFirstSeen, $sequence, $uriCount);
-        }
-
-        if ($carry !== '') {
-            $buffer = $carry . "\n";
-            $chunkProcessor($buffer, strlen($buffer), $counts, $firstSeen, $parsedDateCache, $remainingFirstSeen, $sequence, $uriCount);
-        }
-
-        fclose($handle);
-
-        return [$counts, $firstSeen];
-    }
-
     /**
      * @return array{counts:string,active_days:string}
      */
@@ -2011,19 +1634,6 @@ final class Parser
         );
     }
 
-    private function writeWorkerResult(string $path, array|string $counts, array $firstSeen): void
-    {
-        $handle = fopen($path, 'wb');
-
-        if ($handle === false) {
-            throw new RuntimeException("Unable to open {$path}");
-        }
-
-        $this->writeEncodedWorkerResult($handle, $counts, $firstSeen);
-
-        fclose($handle);
-    }
-
     private function writeWorkerCounts(string $path, string $counts, string $activeDayBitmap): void
     {
         $handle = fopen($path, 'wb');
@@ -2037,67 +1647,10 @@ final class Parser
         fclose($handle);
     }
 
-    private function writeWorkerStream($stream, array|string $counts, array $firstSeen): void
-    {
-        $this->writeEncodedWorkerResult($stream, $counts, $firstSeen);
-    }
-
     private function writeWorkerCountsStream($stream, string $counts, string $activeDayBitmap): void
     {
         $this->writeAll($stream, $activeDayBitmap);
         $this->writeAll($stream, $counts);
-    }
-
-    private function writeEncodedWorkerResult($stream, array|string $counts, array $firstSeen): void
-    {
-        if ($this->shouldUseIgbinary()) {
-            $this->writeAll($stream, igbinary_serialize([$firstSeen, $counts]));
-
-            return;
-        }
-
-        $this->writeAll($stream, $this->encodeFirstSeen($firstSeen));
-        $this->writeAll($stream, $counts);
-    }
-
-    private function encodeWorkerResult(array|string $counts, array $firstSeen): string
-    {
-        if ($this->shouldUseIgbinary()) {
-            return igbinary_serialize([$firstSeen, $counts]);
-        }
-
-        return $this->encodeFirstSeen($firstSeen) . $counts;
-    }
-
-    private function readWorkerResult(
-        string $path,
-        int $slotCount,
-        int $uriCount,
-        bool $rawCounts = false,
-        bool $useByteCounts = false,
-    ): array
-    {
-        if ($this->shouldUseIgbinary()) {
-            $result = igbinary_unserialize(file_get_contents($path));
-
-            if (! is_array($result) || count($result) !== 2) {
-                throw new RuntimeException("Unable to read {$path}");
-            }
-
-            if (! $rawCounts && is_string($result[1])) {
-                $result[1] = array_values(unpack('v*', $result[1]));
-            }
-
-            return $result;
-        }
-
-        $raw = file_get_contents($path);
-
-        if ($raw === false) {
-            throw new RuntimeException("Unable to read {$path}");
-        }
-
-        return $this->decodeWorkerResult($raw, $slotCount, $uriCount, $rawCounts, $useByteCounts);
     }
 
     /**
@@ -2112,46 +1665,6 @@ final class Parser
         }
 
         return $this->decodeWorkerCounts($raw, $slotCount, $useByteCounts);
-    }
-
-    private function decodeWorkerResult(
-        string $raw,
-        int $slotCount,
-        int $uriCount,
-        bool $rawCounts = false,
-        bool $useByteCounts = false,
-    ): array
-    {
-        if ($this->shouldUseIgbinary()) {
-            $result = igbinary_unserialize($raw);
-
-            if (! is_array($result) || count($result) !== 2) {
-                throw new RuntimeException('Unable to decode worker payload');
-            }
-
-            if (! $rawCounts && is_string($result[1])) {
-                $result[1] = array_values(unpack($useByteCounts ? 'C*' : 'v*', $result[1]));
-            }
-
-            return $result;
-        }
-
-        $headerSize = $uriCount * 4;
-        $firstSeen = array_values(unpack('V*', substr($raw, 0, $headerSize)));
-        $countSize = $useByteCounts ? $slotCount : $slotCount * 2;
-        $counts = substr($raw, $headerSize, $countSize);
-
-        if (! $rawCounts) {
-            $counts = array_values(unpack($useByteCounts ? 'C*' : 'v*', $counts));
-        }
-
-        foreach ($firstSeen as $index => $value) {
-            if ($value === 0xFFFFFFFF) {
-                $firstSeen[$index] = -1;
-            }
-        }
-
-        return [$counts, $firstSeen];
     }
 
     /**
@@ -2170,48 +1683,6 @@ final class Parser
             'active_days' => substr($raw, 0, self::ACTIVE_DAY_BITMAP_SIZE),
             'counts' => substr($raw, self::ACTIVE_DAY_BITMAP_SIZE, $countsSize),
         ];
-    }
-
-    private function mergeWorkerResult(
-        array|string|null &$counts,
-        array &$firstSeen,
-        array|string $workerCounts,
-        array $workerSeen,
-        int $workerIndex,
-        int $slotCount,
-        int $uriCount,
-        bool $useSodiumMerge,
-        bool $useByteCounts,
-    ): void {
-        if ($useSodiumMerge) {
-            if ($counts === null) {
-                $counts = $workerCounts;
-            } else {
-                sodium_add($counts, $workerCounts);
-            }
-        } else {
-            if ($useByteCounts) {
-                for ($slot = 0; $slot < $slotCount; $slot++) {
-                    $counts[$slot] += ord($workerCounts[$slot]);
-                }
-            } else {
-                for ($slot = 0; $slot < $slotCount; $slot++) {
-                    $counts[$slot] += $workerCounts[$slot];
-                }
-            }
-        }
-
-        for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
-            if ($workerSeen[$uriIndex] === -1) {
-                continue;
-            }
-
-            $seen = ($workerIndex << 32) | $workerSeen[$uriIndex];
-
-            if ($firstSeen[$uriIndex] === -1 || $seen < $firstSeen[$uriIndex]) {
-                $firstSeen[$uriIndex] = $seen;
-            }
-        }
     }
 
     private function mergeCounts(
@@ -2242,17 +1713,6 @@ final class Parser
         for ($slot = 0; $slot < $slotCount; $slot++) {
             $counts[$slot] += $workerCounts[$slot];
         }
-    }
-
-    private function encodeFirstSeen(array $firstSeen): string
-    {
-        $encodedSeen = [];
-
-        foreach ($firstSeen as $index => $value) {
-            $encodedSeen[$index] = $value === -1 ? 0xFFFFFFFF : $value;
-        }
-
-        return pack('V*', ...$encodedSeen);
     }
 
     private function writeAll($stream, string $payload): void
@@ -2315,17 +1775,6 @@ final class Parser
             || str_starts_with($exception->getMessage(), 'Unable to write worker shared memory payload');
     }
 
-    private function resolveWorkerPayloadSize(int $slotCount, int $uriCount, bool $useByteCounts): int
-    {
-        $headerSize = $uriCount * 4;
-
-        if ($this->shouldUseIgbinary()) {
-            return $headerSize + ($useByteCounts ? $slotCount : $slotCount * 2) + 4096;
-        }
-
-        return $headerSize + ($useByteCounts ? $slotCount : $slotCount * 2);
-    }
-
     private function resolveWorkerCountsPayloadSize(int $slotCount, bool $useByteCounts): int
     {
         return self::ACTIVE_DAY_BITMAP_SIZE + ($useByteCounts ? $slotCount : $slotCount * 2);
@@ -2344,21 +1793,6 @@ final class Parser
         }
 
         @socket_set_option($socket, SOL_SOCKET, $option, $payloadSize);
-    }
-
-    private function shouldUseIgbinary(): bool
-    {
-        if (! function_exists('igbinary_serialize') || ! function_exists('igbinary_unserialize')) {
-            return false;
-        }
-
-        $override = getenv('PARSER_USE_IGBINARY');
-
-        if ($override === false) {
-            return false;
-        }
-
-        return $override !== '0';
     }
 
     private function shouldUseDateCache(): bool

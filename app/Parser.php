@@ -3,8 +3,6 @@
 namespace App;
 
 use App\Commands\Visit;
-use App\Reconstruction\ReconstructionAttempt;
-use App\Reconstruction\ReconstructionResult;
 use RuntimeException;
 
 final class Parser
@@ -20,8 +18,6 @@ final class Parser
     private const READ_SIZE = 1_048_576;
     private const DEFAULT_WORKERS = 10;
     private const FORK_THRESHOLD = 67_108_864;
-    private const DEFAULT_RECONSTRUCT_PREFIX_ROWS = 2_048;
-    private const DEFAULT_RECONSTRUCT_VERIFY_ROWS = 2_048;
 
     private static ?array $uris = null;
     private static ?array $paths = null;
@@ -62,7 +58,6 @@ final class Parser
         $profile = $this->shouldProfile();
         $startedAt = $profile ? microtime(true) : 0.0;
         $prescanDuration = 0.0;
-        $reconstructDuration = 0.0;
         $countDuration = 0.0;
         $outputDuration = 0.0;
         $writeDuration = 0.0;
@@ -74,65 +69,36 @@ final class Parser
         }
 
         self::bootstrap();
-        $mode = $this->resolveParserMode();
         $useCompactDays = $this->shouldUseCompactDayDomain();
         $useBandedDays = $this->shouldUseBandedDayDomain();
-        $counts = null;
-        $orderedUris = [];
-        $activeDayBitmap = self::emptyActiveDayBitmap();
-        $useByteCounts = false;
-
-        if ($mode !== 'parse') {
-            $reconstructPrescanStartedAt = $profile ? microtime(true) : 0.0;
-            $reconstruction = $this->attemptReconstruction($inputPath, $fileSize, $mode);
-            if ($profile) {
-                $reconstructFinishedAt = microtime(true);
-                $prescanDuration += $reconstruction['prescan_duration'];
-                $reconstructDuration += $reconstructFinishedAt - $reconstructPrescanStartedAt - $reconstruction['prescan_duration'];
-            }
-
-            if ($reconstruction['result'] instanceof ReconstructionResult) {
-                self::configureFullDayDomain();
-                $counts = $reconstruction['result']->counts;
-                $orderedUris = $reconstruction['result']->orderedUris;
-                $activeDayBitmap = $reconstruction['result']->activeDayBitmap;
-            } elseif ($mode === 'reconstruct') {
-                throw new RuntimeException('Exact reconstruction could not be proven');
-            }
+        $prescanStartedAt = $profile ? microtime(true) : 0.0;
+        $orderedUris = $this->prescanInput($inputPath, $useCompactDays, $useBandedDays);
+        if ($profile) {
+            $prescanDuration = microtime(true) - $prescanStartedAt;
         }
 
-        if ($counts === null) {
-            $prescanStartedAt = $profile ? microtime(true) : 0.0;
-            $orderedUris = $this->prescanInput($inputPath, $useCompactDays, $useBandedDays);
-            if ($profile) {
-                $prescanDuration += microtime(true) - $prescanStartedAt;
-            }
+        $workerCount = $this->resolveWorkerCount($fileSize);
+        $useByteCounts = $this->shouldUseByteCounts($workerCount);
+        $countStartedAt = $profile ? microtime(true) : 0.0;
 
-            $workerCount = $this->resolveWorkerCount($fileSize);
-            $useByteCounts = $this->shouldUseByteCounts($workerCount);
-            $countStartedAt = $profile ? microtime(true) : 0.0;
-
-            if ($workerCount === 1 || ! function_exists('pcntl_fork')) {
-                ['counts' => $counts, 'active_days' => $activeDayBitmap] = $this->parseRangeCountsOnly($inputPath, 0, $fileSize, $useByteCounts);
-            } else {
-                $this->prewarmCountOnlyChunkProcessor($useByteCounts);
-                ['counts' => $counts, 'active_days' => $activeDayBitmap] = $this->parseInParallelCountsOnly(
-                    $inputPath,
-                    $outputPath,
-                    $fileSize,
-                    $workerCount,
-                    $useByteCounts,
-                );
-            }
-
-            if ($profile) {
-                $countDuration = microtime(true) - $countStartedAt;
-            }
-
-            if (! $useCompactDays && ! $useBandedDays) {
-                self::configureOutputDayDomain($this->resolveOutputDayCodesFromBitmap($activeDayBitmap));
-            }
+        if ($workerCount === 1 || ! function_exists('pcntl_fork')) {
+            ['counts' => $counts, 'active_days' => $activeDayBitmap] = $this->parseRangeCountsOnly($inputPath, 0, $fileSize, $useByteCounts);
         } else {
+            $this->prewarmCountOnlyChunkProcessor($useByteCounts);
+            ['counts' => $counts, 'active_days' => $activeDayBitmap] = $this->parseInParallelCountsOnly(
+                $inputPath,
+                $outputPath,
+                $fileSize,
+                $workerCount,
+                $useByteCounts,
+            );
+        }
+
+        if ($profile) {
+            $countDuration = microtime(true) - $countStartedAt;
+        }
+
+        if (! $useCompactDays && ! $useBandedDays) {
             self::configureOutputDayDomain($this->resolveOutputDayCodesFromBitmap($activeDayBitmap));
         }
 
@@ -147,9 +113,8 @@ final class Parser
         if ($profile) {
             $writeDuration = microtime(true) - $writeStartedAt;
             fwrite(STDERR, sprintf(
-                "profile prescan=%.6f reconstruct=%.6f count=%.6f output=%.6f write=%.6f total=%.6f\n",
+                "profile prescan=%.6f count=%.6f output=%.6f write=%.6f total=%.6f\n",
                 $prescanDuration,
-                $reconstructDuration,
                 $countDuration,
                 $outputDuration,
                 $writeDuration,
@@ -511,139 +476,6 @@ final class Parser
         }
 
         return self::DEFAULT_WORKERS;
-    }
-
-    /**
-     * @return array{result:?ReconstructionResult,prescan_duration:float}
-     */
-    private function attemptReconstruction(string $inputPath, int $fileSize, string $mode): array
-    {
-        if ($mode === 'auto' && ! $this->shouldAttemptAutoReconstruction($inputPath)) {
-            return [
-                'result' => null,
-                'prescan_duration' => 0.0,
-            ];
-        }
-
-        $rows = $this->resolveReconstructionRowCount($fileSize, $inputPath);
-        $seed = $this->resolveReconstructionSeed($inputPath);
-
-        if ($rows === null || $seed === null) {
-            return [
-                'result' => null,
-                'prescan_duration' => 0.0,
-            ];
-        }
-
-        $attempt = new ReconstructionAttempt(self::$uris);
-        $prefixRows = $this->resolveReconstructionPrefixRows();
-        $verificationRows = $this->resolveReconstructionVerificationRows();
-        $prescanStartedAt = microtime(true);
-        $scan = $attempt->scanPrefix(
-            $inputPath,
-            $prefixRows,
-            $verificationRows,
-        );
-        $prescanDuration = microtime(true) - $prescanStartedAt;
-        $result = $attempt->attemptFromScan($inputPath, $scan, $rows, $seed);
-
-        if ($mode === 'reconstruct' && $result === null) {
-            throw new RuntimeException('Exact reconstruction verification failed');
-        }
-
-        return [
-            'result' => $result,
-            'prescan_duration' => $prescanDuration,
-        ];
-    }
-
-    private function resolveParserMode(): string
-    {
-        $mode = getenv('PARSER_MODE');
-
-        return match ($mode) {
-            'parse', 'reconstruct' => $mode,
-            default => 'auto',
-        };
-    }
-
-    private function shouldAttemptAutoReconstruction(string $inputPath): bool
-    {
-        $value = getenv('PARSER_ENABLE_AUTO_RECONSTRUCTION');
-
-        if ($value !== false) {
-            return in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
-        }
-
-        return in_array(basename($inputPath), ['real-data.csv', '100m.csv'], true);
-    }
-
-    private function resolveReconstructionRowCount(int $fileSize, string $inputPath): ?int
-    {
-        $override = getenv('PARSER_RECONSTRUCT_ROWS');
-
-        if ($override !== false && ctype_digit($override)) {
-            return max(1, (int) $override);
-        }
-
-        $basename = basename($inputPath);
-
-        if ($basename === 'real-data.csv' || $basename === '100m.csv') {
-            return 100_000_000;
-        }
-
-        if ($basename === '10m.csv') {
-            return 10_000_000;
-        }
-
-        if ($basename === '5m.csv') {
-            return 5_000_000;
-        }
-
-        if ($basename === 'data.csv' || $basename === '1m.csv') {
-            return 1_000_000;
-        }
-
-        return null;
-    }
-
-    private function resolveReconstructionSeed(string $inputPath): ?int
-    {
-        $seed = getenv('PARSER_RECONSTRUCT_SEED');
-
-        if ($seed === false || $seed === '') {
-            return in_array(basename($inputPath), ['real-data.csv', '100m.csv'], true)
-                ? 1772177204
-                : null;
-        }
-
-        if (! preg_match('/^-?\d+$/', $seed)) {
-            throw new RuntimeException('PARSER_RECONSTRUCT_SEED must be an integer');
-        }
-
-        return (int) $seed;
-    }
-
-    private function resolveReconstructionPrefixRows(): int
-    {
-        $override = getenv('PARSER_RECONSTRUCT_PREFIX_ROWS');
-
-        if ($override !== false && ctype_digit($override)) {
-            return max(1, (int) $override);
-        }
-
-        return self::DEFAULT_RECONSTRUCT_PREFIX_ROWS;
-    }
-
-    private function resolveReconstructionVerificationRows(): int
-    {
-        $override = getenv('PARSER_RECONSTRUCT_VERIFY_ROWS');
-
-        if ($override !== false && ctype_digit($override)) {
-            return max(1, (int) $override);
-        }
-
-        return self::DEFAULT_RECONSTRUCT_VERIFY_ROWS;
     }
 
     private function orderedUrisFromFirstSeen(array $firstSeen): array

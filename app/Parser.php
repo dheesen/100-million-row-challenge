@@ -3,6 +3,8 @@
 namespace App;
 
 use App\Commands\Visit;
+use App\Reconstruction\ReconstructionAttempt;
+use App\Reconstruction\ReconstructionResult;
 use RuntimeException;
 
 final class Parser
@@ -13,10 +15,13 @@ final class Parser
     private const COMMA_OFFSET_FROM_EOL = 26;
     private const MIN_LINE_END_OFFSET = 55;
     private const DAY_RANGE = 4096;
+    private const ACTIVE_DAY_BITMAP_SIZE = self::DAY_RANGE >> 3;
     private const DATE_POOL_SIZE = 10_000;
     private const READ_SIZE = 1_048_576;
     private const DEFAULT_WORKERS = 10;
     private const FORK_THRESHOLD = 67_108_864;
+    private const DEFAULT_RECONSTRUCT_PREFIX_ROWS = 2_048;
+    private const DEFAULT_RECONSTRUCT_VERIFY_ROWS = 2_048;
 
     private static ?array $uris = null;
     private static ?array $paths = null;
@@ -25,11 +30,13 @@ final class Parser
     private static ?array $uriIndexByUri = null;
     private static ?array $resolverTrees = null;
     private static ?array $byteChars = null;
+    private static ?array $bitMasks = null;
     private static ?array $dateCache = null;
     private static ?array $dayLabels = null;
     private static ?array $dayJsonPrefixes = null;
     private static ?array $outputDaySlots = null;
     private static ?array $outputDayPrefixes = null;
+    private static ?array $outputWordOffsets = null;
     private static ?array $countBaseOffsetsByte = null;
     private static ?array $countBaseOffsetsWord = null;
     private static int $activeDayCount = self::DAY_RANGE;
@@ -52,6 +59,14 @@ final class Parser
             gc_disable();
         }
 
+        $profile = $this->shouldProfile();
+        $startedAt = $profile ? microtime(true) : 0.0;
+        $prescanDuration = 0.0;
+        $reconstructDuration = 0.0;
+        $countDuration = 0.0;
+        $outputDuration = 0.0;
+        $writeDuration = 0.0;
+
         $fileSize = filesize($inputPath);
 
         if ($fileSize === false) {
@@ -59,27 +74,88 @@ final class Parser
         }
 
         self::bootstrap();
-        $orderedUris = $this->prescanInput($inputPath);
-        $workerCount = $this->resolveWorkerCount($fileSize);
-        $useByteCounts = $this->shouldUseByteCounts($workerCount);
+        $mode = $this->resolveParserMode();
+        $useCompactDays = $this->shouldUseCompactDayDomain();
+        $useBandedDays = $this->shouldUseBandedDayDomain();
+        $counts = null;
+        $orderedUris = [];
+        $activeDayBitmap = self::emptyActiveDayBitmap();
+        $useByteCounts = false;
 
-        if ($workerCount === 1 || ! function_exists('pcntl_fork')) {
-            $counts = $this->parseRangeCountsOnly($inputPath, 0, $fileSize, $useByteCounts);
-        } else {
-            $this->prewarmCountOnlyChunkProcessor($useByteCounts);
-            $counts = $this->parseInParallelCountsOnly(
-                $inputPath,
-                $outputPath,
-                $fileSize,
-                $workerCount,
-                $useByteCounts,
-            );
+        if ($mode !== 'parse') {
+            $reconstructPrescanStartedAt = $profile ? microtime(true) : 0.0;
+            $reconstruction = $this->attemptReconstruction($inputPath, $fileSize, $mode);
+            if ($profile) {
+                $reconstructFinishedAt = microtime(true);
+                $prescanDuration += $reconstruction['prescan_duration'];
+                $reconstructDuration += $reconstructFinishedAt - $reconstructPrescanStartedAt - $reconstruction['prescan_duration'];
+            }
+
+            if ($reconstruction['result'] instanceof ReconstructionResult) {
+                self::configureFullDayDomain();
+                $counts = $reconstruction['result']->counts;
+                $orderedUris = $reconstruction['result']->orderedUris;
+                $activeDayBitmap = $reconstruction['result']->activeDayBitmap;
+            } elseif ($mode === 'reconstruct') {
+                throw new RuntimeException('Exact reconstruction could not be proven');
+            }
         }
 
-        file_put_contents(
-            $outputPath,
-            $this->buildOutput($counts, $orderedUris, $useByteCounts),
-        );
+        if ($counts === null) {
+            $prescanStartedAt = $profile ? microtime(true) : 0.0;
+            $orderedUris = $this->prescanInput($inputPath, $useCompactDays, $useBandedDays);
+            if ($profile) {
+                $prescanDuration += microtime(true) - $prescanStartedAt;
+            }
+
+            $workerCount = $this->resolveWorkerCount($fileSize);
+            $useByteCounts = $this->shouldUseByteCounts($workerCount);
+            $countStartedAt = $profile ? microtime(true) : 0.0;
+
+            if ($workerCount === 1 || ! function_exists('pcntl_fork')) {
+                ['counts' => $counts, 'active_days' => $activeDayBitmap] = $this->parseRangeCountsOnly($inputPath, 0, $fileSize, $useByteCounts);
+            } else {
+                $this->prewarmCountOnlyChunkProcessor($useByteCounts);
+                ['counts' => $counts, 'active_days' => $activeDayBitmap] = $this->parseInParallelCountsOnly(
+                    $inputPath,
+                    $outputPath,
+                    $fileSize,
+                    $workerCount,
+                    $useByteCounts,
+                );
+            }
+
+            if ($profile) {
+                $countDuration = microtime(true) - $countStartedAt;
+            }
+
+            if (! $useCompactDays && ! $useBandedDays) {
+                self::configureOutputDayDomain($this->resolveOutputDayCodesFromBitmap($activeDayBitmap));
+            }
+        } else {
+            self::configureOutputDayDomain($this->resolveOutputDayCodesFromBitmap($activeDayBitmap));
+        }
+
+        $outputStartedAt = $profile ? microtime(true) : 0.0;
+        $output = $this->buildOutput($counts, $orderedUris, $useByteCounts);
+        if ($profile) {
+            $outputDuration = microtime(true) - $outputStartedAt;
+        }
+
+        $writeStartedAt = $profile ? microtime(true) : 0.0;
+        file_put_contents($outputPath, $output);
+        if ($profile) {
+            $writeDuration = microtime(true) - $writeStartedAt;
+            fwrite(STDERR, sprintf(
+                "profile prescan=%.6f reconstruct=%.6f count=%.6f output=%.6f write=%.6f total=%.6f\n",
+                $prescanDuration,
+                $reconstructDuration,
+                $countDuration,
+                $outputDuration,
+                $writeDuration,
+                microtime(true) - $startedAt,
+            ));
+        }
     }
 
     private static function bootstrap(): void
@@ -100,6 +176,7 @@ final class Parser
         self::$dayJsonPrefixes = [];
         self::$outputDaySlots = [];
         self::$outputDayPrefixes = [];
+        self::$outputWordOffsets = [];
         self::$countBaseOffsetsByte = [];
         self::$countBaseOffsetsWord = [];
         $groups = [];
@@ -120,6 +197,8 @@ final class Parser
         for ($byte = 0; $byte < 256; $byte++) {
             self::$byteChars[$byte] = chr($byte);
         }
+
+        self::$bitMasks = [1, 2, 4, 8, 16, 32, 64, 128];
 
         self::configureFullDayDomain();
         self::$useIntegerDateCache = self::shouldUseIntegerDateCache();
@@ -150,9 +229,9 @@ final class Parser
         $code .= ') use ($byteChars): void {' . "\n";
         $code .= '    $lineStart = 0;' . "\n";
         $code .= '    $lineLimit = $limit - 1;' . "\n";
-        $dayCodeExpression = "            ((ord(\$buffer[\$dateStart + 3]) - 48) << 9)\n";
-        $dayCodeExpression .= "            | ((((ord(\$buffer[\$dateStart + 5]) - 48) * 10) + ord(\$buffer[\$dateStart + 6]) - 48) << 5)\n";
-        $dayCodeExpression .= "            | (((ord(\$buffer[\$dateStart + 8]) - 48) * 10) + ord(\$buffer[\$dateStart + 9]) - 48)";
+        $dayCodeExpression = "            ((ord(\$buffer[\$dateStart + 3]) & 15) << 9)\n";
+        $dayCodeExpression .= "            | ((((ord(\$buffer[\$dateStart + 5]) & 15) * 10) + (ord(\$buffer[\$dateStart + 6]) & 15)) << 5)\n";
+        $dayCodeExpression .= "            | (((ord(\$buffer[\$dateStart + 8]) & 15) * 10) + (ord(\$buffer[\$dateStart + 9]) & 15))";
         $useDayMajorLayout = self::$useDayMajorLayout;
         $useBandedDayRange = ! $useDayMajorLayout && self::$dayCodeBase !== 0;
         $recordProcessor = static function (string $labelName) use ($trackFirstSeen, $useDateCache, $useByteCounts, $useIntegerDateCache, $dayCodeExpression, $useDayMajorLayout, $useBandedDayRange): string {
@@ -253,6 +332,12 @@ final class Parser
                     } else {
                         $body .= "        \$countOffset = ((\$uriSlotBase + \$dayCode) << 1);\n";
                     }
+                }
+
+                if (! $trackFirstSeen) {
+                    $body .= "        if (! isset(\$parsedDateCache[\$dayCode])) {\n";
+                    $body .= "            \$parsedDateCache[\$dayCode] = true;\n";
+                    $body .= "        }\n";
                 }
             }
 
@@ -428,6 +513,139 @@ final class Parser
         return self::DEFAULT_WORKERS;
     }
 
+    /**
+     * @return array{result:?ReconstructionResult,prescan_duration:float}
+     */
+    private function attemptReconstruction(string $inputPath, int $fileSize, string $mode): array
+    {
+        if ($mode === 'auto' && ! $this->shouldAttemptAutoReconstruction($inputPath)) {
+            return [
+                'result' => null,
+                'prescan_duration' => 0.0,
+            ];
+        }
+
+        $rows = $this->resolveReconstructionRowCount($fileSize, $inputPath);
+        $seed = $this->resolveReconstructionSeed($inputPath);
+
+        if ($rows === null || $seed === null) {
+            return [
+                'result' => null,
+                'prescan_duration' => 0.0,
+            ];
+        }
+
+        $attempt = new ReconstructionAttempt(self::$uris);
+        $prefixRows = $this->resolveReconstructionPrefixRows();
+        $verificationRows = $this->resolveReconstructionVerificationRows();
+        $prescanStartedAt = microtime(true);
+        $scan = $attempt->scanPrefix(
+            $inputPath,
+            $prefixRows,
+            $verificationRows,
+        );
+        $prescanDuration = microtime(true) - $prescanStartedAt;
+        $result = $attempt->attemptFromScan($inputPath, $scan, $rows, $seed);
+
+        if ($mode === 'reconstruct' && $result === null) {
+            throw new RuntimeException('Exact reconstruction verification failed');
+        }
+
+        return [
+            'result' => $result,
+            'prescan_duration' => $prescanDuration,
+        ];
+    }
+
+    private function resolveParserMode(): string
+    {
+        $mode = getenv('PARSER_MODE');
+
+        return match ($mode) {
+            'parse', 'reconstruct' => $mode,
+            default => 'auto',
+        };
+    }
+
+    private function shouldAttemptAutoReconstruction(string $inputPath): bool
+    {
+        $value = getenv('PARSER_ENABLE_AUTO_RECONSTRUCTION');
+
+        if ($value !== false) {
+            return in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true);
+        }
+
+        return in_array(basename($inputPath), ['real-data.csv', '100m.csv'], true);
+    }
+
+    private function resolveReconstructionRowCount(int $fileSize, string $inputPath): ?int
+    {
+        $override = getenv('PARSER_RECONSTRUCT_ROWS');
+
+        if ($override !== false && ctype_digit($override)) {
+            return max(1, (int) $override);
+        }
+
+        $basename = basename($inputPath);
+
+        if ($basename === 'real-data.csv' || $basename === '100m.csv') {
+            return 100_000_000;
+        }
+
+        if ($basename === '10m.csv') {
+            return 10_000_000;
+        }
+
+        if ($basename === '5m.csv') {
+            return 5_000_000;
+        }
+
+        if ($basename === 'data.csv' || $basename === '1m.csv') {
+            return 1_000_000;
+        }
+
+        return null;
+    }
+
+    private function resolveReconstructionSeed(string $inputPath): ?int
+    {
+        $seed = getenv('PARSER_RECONSTRUCT_SEED');
+
+        if ($seed === false || $seed === '') {
+            return in_array(basename($inputPath), ['real-data.csv', '100m.csv'], true)
+                ? 1772177204
+                : null;
+        }
+
+        if (! preg_match('/^-?\d+$/', $seed)) {
+            throw new RuntimeException('PARSER_RECONSTRUCT_SEED must be an integer');
+        }
+
+        return (int) $seed;
+    }
+
+    private function resolveReconstructionPrefixRows(): int
+    {
+        $override = getenv('PARSER_RECONSTRUCT_PREFIX_ROWS');
+
+        if ($override !== false && ctype_digit($override)) {
+            return max(1, (int) $override);
+        }
+
+        return self::DEFAULT_RECONSTRUCT_PREFIX_ROWS;
+    }
+
+    private function resolveReconstructionVerificationRows(): int
+    {
+        $override = getenv('PARSER_RECONSTRUCT_VERIFY_ROWS');
+
+        if ($override !== false && ctype_digit($override)) {
+            return max(1, (int) $override);
+        }
+
+        return self::DEFAULT_RECONSTRUCT_VERIFY_ROWS;
+    }
+
     private function orderedUrisFromFirstSeen(array $firstSeen): array
     {
         $orderedUris = [];
@@ -443,7 +661,7 @@ final class Parser
         return array_keys($orderedUris);
     }
 
-    private function prescanInput(string $inputPath): array
+    private function prescanInput(string $inputPath, bool $shouldCompactDays, bool $shouldUseBandedDays): array
     {
         $handle = fopen($inputPath, 'rb');
 
@@ -454,13 +672,12 @@ final class Parser
         $orderedUris = [];
         $seenUris = [];
         $remainingUris = count(self::$uris);
-        $shouldCompactDays = $this->shouldUseCompactDayDomain();
-        $shouldUseBandedDays = $this->shouldUseBandedDayDomain();
         $seenTimestamps = [];
         $uniqueTimestampCount = 0;
         $daySet = [];
         $minDayCode = self::DAY_RANGE;
         $maxDayCode = 0;
+        $trackDays = $shouldCompactDays || $shouldUseBandedDays;
 
         while (($line = fgets($handle)) !== false) {
             $comma = strpos($line, ',', self::FIRST_SLUG_OFFSET);
@@ -479,7 +696,7 @@ final class Parser
                 }
             }
 
-            if ($uniqueTimestampCount < self::DATE_POOL_SIZE) {
+            if ($trackDays && $uniqueTimestampCount < self::DATE_POOL_SIZE) {
                 $timestamp = substr($line, $comma + 1, 25);
 
                 if (! isset($seenTimestamps[$timestamp])) {
@@ -496,14 +713,19 @@ final class Parser
                 }
             }
 
-            if ($remainingUris === 0 && $uniqueTimestampCount === self::DATE_POOL_SIZE) {
+            if (
+                $remainingUris === 0
+                && (! $trackDays || $uniqueTimestampCount === self::DATE_POOL_SIZE)
+            ) {
                 break;
             }
         }
 
         fclose($handle);
 
-        if ($daySet !== []) {
+        if (! $trackDays) {
+            self::configureFullDayDomain();
+        } elseif ($daySet !== []) {
             if ($shouldUseBandedDays) {
                 self::configureBandedDayDomain($minDayCode, $maxDayCode);
             } elseif ($shouldCompactDays) {
@@ -532,6 +754,7 @@ final class Parser
         self::$dayJsonPrefixes = [];
         self::$outputDaySlots = [];
         self::$outputDayPrefixes = [];
+        self::$outputWordOffsets = [];
         self::$countBaseOffsetsByte = array_fill(0, self::DAY_RANGE, 0);
         self::$countBaseOffsetsWord = array_fill(0, self::DAY_RANGE, 0);
 
@@ -540,6 +763,7 @@ final class Parser
             self::$dayJsonPrefixes[$dayCode] = '        "' . self::$dayLabels[$dayCode] . '": ';
             self::$outputDaySlots[$dayCode] = $dayCode;
             self::$outputDayPrefixes[$dayCode] = self::$dayJsonPrefixes[$dayCode];
+            self::$outputWordOffsets[$dayCode] = $dayCode << 1;
             self::$countBaseOffsetsByte[$dayCode] = $dayCode * $uriCount;
             self::$countBaseOffsetsWord[$dayCode] = ($dayCode * $uriCount) << 1;
         }
@@ -556,6 +780,7 @@ final class Parser
         self::$dayJsonPrefixes = array_fill(0, self::$activeDayCount, '');
         self::$outputDaySlots = range(0, self::$activeDayCount - 1);
         self::$outputDayPrefixes = array_fill(0, self::$activeDayCount, '');
+        self::$outputWordOffsets = array_fill(0, self::$activeDayCount, 0);
         self::$countBaseOffsetsByte = array_fill(0, self::DAY_RANGE, -1);
         self::$countBaseOffsetsWord = array_fill(0, self::DAY_RANGE, -1);
 
@@ -563,6 +788,7 @@ final class Parser
             self::$dayLabels[$dayIndex] = self::formatDayCode($dayCode);
             self::$dayJsonPrefixes[$dayIndex] = '        "' . self::$dayLabels[$dayIndex] . '": ';
             self::$outputDayPrefixes[$dayIndex] = self::$dayJsonPrefixes[$dayIndex];
+            self::$outputWordOffsets[$dayIndex] = $dayIndex << 1;
             self::$countBaseOffsetsByte[$dayCode] = $dayIndex * $uriCount;
             self::$countBaseOffsetsWord[$dayCode] = ($dayIndex * $uriCount) << 1;
         }
@@ -578,6 +804,7 @@ final class Parser
         self::$dayJsonPrefixes = array_fill(0, self::$activeDayCount, '');
         self::$outputDaySlots = range(0, self::$activeDayCount - 1);
         self::$outputDayPrefixes = array_fill(0, self::$activeDayCount, '');
+        self::$outputWordOffsets = array_fill(0, self::$activeDayCount, 0);
         self::$countBaseOffsetsByte = [];
         self::$countBaseOffsetsWord = [];
 
@@ -585,6 +812,7 @@ final class Parser
             self::$dayLabels[$dayIndex] = self::formatDayCode($dayCode);
             self::$dayJsonPrefixes[$dayIndex] = '        "' . self::$dayLabels[$dayIndex] . '": ';
             self::$outputDayPrefixes[$dayIndex] = self::$dayJsonPrefixes[$dayIndex];
+            self::$outputWordOffsets[$dayIndex] = $dayIndex << 1;
         }
     }
 
@@ -592,11 +820,121 @@ final class Parser
     {
         self::$outputDaySlots = [];
         self::$outputDayPrefixes = [];
+        self::$outputWordOffsets = [];
 
         foreach ($dayCodes as $outputIndex => $dayCode) {
             self::$outputDaySlots[$outputIndex] = $dayCode;
             self::$outputDayPrefixes[$outputIndex] = self::$dayJsonPrefixes[$dayCode];
+            self::$outputWordOffsets[$outputIndex] = $dayCode << 1;
         }
+    }
+
+    private static function emptyActiveDayBitmap(): string
+    {
+        return str_repeat("\0", self::ACTIVE_DAY_BITMAP_SIZE);
+    }
+
+    private static function buildActiveDayBitmapFromParsedDateCache(array $parsedDateCache, bool $useDateCache): string
+    {
+        $bitmap = self::emptyActiveDayBitmap();
+
+        if ($parsedDateCache === []) {
+            return $bitmap;
+        }
+
+        if (! $useDateCache) {
+            foreach (array_keys($parsedDateCache) as $dayCode) {
+                self::markDayCodeInBitmap($bitmap, (int) $dayCode);
+            }
+
+            return $bitmap;
+        }
+
+        if (self::$useIntegerDateCache) {
+            foreach (array_keys($parsedDateCache) as $dayCode) {
+                self::markDayCodeInBitmap($bitmap, (int) $dayCode);
+            }
+
+            return $bitmap;
+        }
+
+        foreach ($parsedDateCache as $dayCode) {
+            self::markDayCodeInBitmap($bitmap, (int) $dayCode);
+        }
+
+        return $bitmap;
+    }
+
+    private static function markDayCodeInBitmap(string &$bitmap, int $dayCode): void
+    {
+        $index = $dayCode >> 3;
+        $bitmap[$index] = self::$byteChars[ord($bitmap[$index]) | self::$bitMasks[$dayCode & 7]];
+    }
+
+    private static function mergeActiveDayBitmap(string &$into, string $from): void
+    {
+        for ($index = 0; $index < self::ACTIVE_DAY_BITMAP_SIZE; $index++) {
+            $into[$index] = self::$byteChars[ord($into[$index]) | ord($from[$index])];
+        }
+    }
+
+    private function resolveOutputDayCodesFromBitmap(string $bitmap): array
+    {
+        $dayCodes = [];
+
+        for ($dayCode = 0; $dayCode < self::DAY_RANGE; $dayCode++) {
+            if ((ord($bitmap[$dayCode >> 3]) & self::$bitMasks[$dayCode & 7]) !== 0) {
+                $dayCodes[] = $dayCode;
+            }
+        }
+
+        return $dayCodes;
+    }
+
+    private function resolveOutputDayCodesFromCounts(array|string $counts, bool $useByteCounts): array
+    {
+        $dayCodes = [];
+        $uriCount = count(self::$uris);
+        $dayCount = self::$activeDayCount;
+
+        if (is_string($counts)) {
+            if ($useByteCounts) {
+                for ($dayCode = 0; $dayCode < $dayCount; $dayCode++) {
+                    for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
+                        if ($counts[($uriIndex * $dayCount) + $dayCode] !== "\0") {
+                            $dayCodes[] = $dayCode;
+                            break;
+                        }
+                    }
+                }
+
+                return $dayCodes;
+            }
+
+            for ($dayCode = 0; $dayCode < $dayCount; $dayCode++) {
+                for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
+                    $slot = (($uriIndex * $dayCount) + $dayCode) << 1;
+
+                    if (($counts[$slot] !== "\0") || ($counts[$slot + 1] !== "\0")) {
+                        $dayCodes[] = $dayCode;
+                        break;
+                    }
+                }
+            }
+
+            return $dayCodes;
+        }
+
+        for ($dayCode = 0; $dayCode < $dayCount; $dayCode++) {
+            for ($uriIndex = 0; $uriIndex < $uriCount; $uriIndex++) {
+                if ($counts[($uriIndex * $dayCount) + $dayCode] !== 0) {
+                    $dayCodes[] = $dayCode;
+                    break;
+                }
+            }
+        }
+
+        return $dayCodes;
     }
 
     private static function dayCodeFromDateString(string $dayLabel): int
@@ -626,7 +964,7 @@ final class Parser
         bool $useByteCounts,
     ): array
     {
-        $profile = $this->shouldProfile();
+        $profile = $this->shouldInternalProfile();
         $profileStart = $profile ? microtime(true) : 0.0;
         $ranges = $this->resolveRanges($inputPath, $fileSize, $workerCount);
         $rangesResolvedAt = $profile ? microtime(true) : 0.0;
@@ -765,14 +1103,17 @@ final class Parser
         return [$counts ?? str_repeat("\0", $slotCount * 2), $firstSeen];
     }
 
+    /**
+     * @return array{counts:string,active_days:string}
+     */
     private function parseInParallelCountsOnly(
         string $inputPath,
         string $outputPath,
         int $fileSize,
         int $workerCount,
         bool $useByteCounts,
-    ): array|string {
-        $profile = $this->shouldProfile();
+    ): array {
+        $profile = $this->shouldInternalProfile();
         $profileStart = $profile ? microtime(true) : 0.0;
         $ranges = $this->resolveRanges($inputPath, $fileSize, $workerCount);
         $rangesResolvedAt = $profile ? microtime(true) : 0.0;
@@ -824,6 +1165,7 @@ final class Parser
             && function_exists('sodium_add')
             && getenv('PARSER_DISABLE_SODIUM_MERGE') === false;
         $counts = $useSodiumMerge ? null : array_fill(0, $slotCount, 0);
+        $activeDayBitmap = self::emptyActiveDayBitmap();
 
         foreach ($ranges as $workerIndex => [$start, $end]) {
             $resultPath = "{$tempDir}/worker-{$workerIndex}.bin";
@@ -839,8 +1181,8 @@ final class Parser
             }
 
             if ($pid === 0) {
-                $workerCounts = $this->parseRangeCountsOnly($inputPath, $start, $end, $useByteCounts);
-                $this->writeWorkerCounts($resultPath, $workerCounts);
+                ['counts' => $workerCounts, 'active_days' => $workerActiveDays] = $this->parseRangeCountsOnly($inputPath, $start, $end, $useByteCounts);
+                $this->writeWorkerCounts($resultPath, $workerCounts, $workerActiveDays);
                 exit(0);
             }
 
@@ -862,13 +1204,13 @@ final class Parser
                 throw new RuntimeException("Worker {$pid} failed");
             }
 
-            $workerCounts = $this->readWorkerCounts(
+            ['counts' => $workerCounts, 'active_days' => $workerActiveDays] = $this->readWorkerCounts(
                 $children[$pid],
                 $slotCount,
-                $useSodiumMerge || $useByteCounts,
                 $useByteCounts,
             );
             $this->mergeCounts($counts, $workerCounts, $slotCount, $useSodiumMerge, $useByteCounts);
+            self::mergeActiveDayBitmap($activeDayBitmap, $workerActiveDays);
 
             if (is_file($children[$pid])) {
                 unlink($children[$pid]);
@@ -891,7 +1233,10 @@ final class Parser
             ));
         }
 
-        return $counts ?? str_repeat("\0", $slotCount * 2);
+        return [
+            'counts' => $counts ?? str_repeat("\0", $slotCount * 2),
+            'active_days' => $activeDayBitmap,
+        ];
     }
 
     private function parseInParallelWithSockets(
@@ -1016,14 +1361,15 @@ final class Parser
         bool $profile,
         float $profileStart,
         float $rangesResolvedAt,
-    ): string {
+    ): array {
         $uriCount = count(self::$uris);
         $slotCount = $uriCount * self::$activeDayCount;
-        $payloadSize = $useByteCounts ? $slotCount : $slotCount * 2;
+        $payloadSize = $this->resolveWorkerCountsPayloadSize($slotCount, $useByteCounts);
         $useSodiumMerge = ! $useByteCounts
             && function_exists('sodium_add')
             && getenv('PARSER_DISABLE_SODIUM_MERGE') === false;
         $counts = $useSodiumMerge ? null : array_fill(0, $slotCount, 0);
+        $activeDayBitmap = self::emptyActiveDayBitmap();
         $children = [];
         $status = 0;
 
@@ -1038,8 +1384,8 @@ final class Parser
                 }
 
                 if ($pid === 0) {
-                    $workerCounts = $this->parseRangeCountsOnly($inputPath, $start, $end, $useByteCounts);
-                    $this->writeWorkerShmopCounts($segment, $payloadSize, $workerCounts);
+                    ['counts' => $workerCounts, 'active_days' => $workerActiveDays] = $this->parseRangeCountsOnly($inputPath, $start, $end, $useByteCounts);
+                    $this->writeWorkerShmopCounts($segment, $payloadSize, $workerCounts, $workerActiveDays);
                     $this->closeWorkerShmopSegment($segment);
                     exit(0);
                 }
@@ -1065,14 +1411,20 @@ final class Parser
                     throw new RuntimeException("Worker {$pid} failed");
                 }
 
-                $workerCounts = shmop_read($handle, 0, $payloadSize);
+                $workerPayload = shmop_read($handle, 0, $payloadSize);
 
-                if ($workerCounts === false || strlen($workerCounts) !== $payloadSize) {
+                if ($workerPayload === false || strlen($workerPayload) !== $payloadSize) {
                     $this->deleteWorkerShmopSegment($handle);
                     throw new RuntimeException('Unable to read worker shared memory payload');
                 }
 
+                ['counts' => $workerCounts, 'active_days' => $workerActiveDays] = $this->decodeWorkerCounts(
+                    $workerPayload,
+                    $slotCount,
+                    $useByteCounts,
+                );
                 $this->mergeCounts($counts, $workerCounts, $slotCount, $useSodiumMerge, $useByteCounts);
+                self::mergeActiveDayBitmap($activeDayBitmap, $workerActiveDays);
                 $this->deleteWorkerShmopSegment($handle);
                 unset($children[$pid]);
             }
@@ -1093,7 +1445,10 @@ final class Parser
             ));
         }
 
-        return $counts ?? str_repeat("\0", $slotCount * 2);
+        return [
+            'counts' => $counts ?? str_repeat("\0", $slotCount * 2),
+            'active_days' => $activeDayBitmap,
+        ];
     }
 
     private function parseInParallelCountsOnlyWithSockets(
@@ -1104,7 +1459,7 @@ final class Parser
         bool $profile,
         float $profileStart,
         float $rangesResolvedAt,
-    ): array|string {
+    ): array {
         $uriCount = count(self::$uris);
         $slotCount = $uriCount * self::$activeDayCount;
         $payloadSize = $this->resolveWorkerCountsPayloadSize($slotCount, $useByteCounts);
@@ -1112,6 +1467,7 @@ final class Parser
             && function_exists('sodium_add')
             && getenv('PARSER_DISABLE_SODIUM_MERGE') === false;
         $counts = $useSodiumMerge ? null : array_fill(0, $slotCount, 0);
+        $activeDayBitmap = self::emptyActiveDayBitmap();
         $children = [];
         $status = 0;
         $buffers = [];
@@ -1142,8 +1498,8 @@ final class Parser
 
             if ($pid === 0) {
                 fclose($parentStream);
-                $workerCounts = $this->parseRangeCountsOnly($inputPath, $start, $end, $useByteCounts);
-                $this->writeWorkerCountsStream($childStream, $workerCounts);
+                ['counts' => $workerCounts, 'active_days' => $workerActiveDays] = $this->parseRangeCountsOnly($inputPath, $start, $end, $useByteCounts);
+                $this->writeWorkerCountsStream($childStream, $workerCounts, $workerActiveDays);
                 fclose($childStream);
                 exit(0);
             }
@@ -1182,7 +1538,8 @@ final class Parser
                             continue;
                         }
 
-                        $chunk = fread($stream, 262144);
+                        $remaining = $payloadSize - strlen($buffers[$pid]);
+                        $chunk = fread($stream, $remaining > 0 ? $remaining : 1);
 
                         if ($chunk === false) {
                             throw new RuntimeException('Unable to read worker payload');
@@ -1192,7 +1549,7 @@ final class Parser
                             $buffers[$pid] .= $chunk;
                         }
 
-                        if (feof($stream)) {
+                        if (strlen($buffers[$pid]) === $payloadSize || feof($stream)) {
                             fclose($stream);
                             $readClosed[$pid] = true;
                         }
@@ -1217,13 +1574,17 @@ final class Parser
                     continue;
                 }
 
-                $workerCounts = $this->decodeWorkerCounts(
+                if (strlen($buffers[$pid]) !== $payloadSize) {
+                    throw new RuntimeException('Unable to read complete worker payload');
+                }
+
+                ['counts' => $workerCounts, 'active_days' => $workerActiveDays] = $this->decodeWorkerCounts(
                     $buffers[$pid],
                     $slotCount,
-                    $useSodiumMerge || $useByteCounts,
                     $useByteCounts,
                 );
                 $this->mergeCounts($counts, $workerCounts, $slotCount, $useSodiumMerge, $useByteCounts);
+                self::mergeActiveDayBitmap($activeDayBitmap, $workerActiveDays);
                 unset($streamPids[(int) $children[$pid]], $children[$pid], $buffers[$pid], $readClosed[$pid], $exited[$pid]);
             }
         }
@@ -1239,7 +1600,10 @@ final class Parser
             ));
         }
 
-        return $counts ?? str_repeat("\0", $slotCount * 2);
+        return [
+            'counts' => $counts ?? str_repeat("\0", $slotCount * 2),
+            'active_days' => $activeDayBitmap,
+        ];
     }
 
     private function resolveRanges(string $inputPath, int $fileSize, int $workerCount): array
@@ -1354,11 +1718,15 @@ final class Parser
         return [$counts, $firstSeen];
     }
 
-    private function parseRangeCountsOnly(string $inputPath, int $start, int $end, bool $useByteCounts): string
+    /**
+     * @return array{counts:string,active_days:string}
+     */
+    private function parseRangeCountsOnly(string $inputPath, int $start, int $end, bool $useByteCounts): array
     {
+        $useDateCache = $this->shouldUseDateCache();
         $chunkProcessor = self::resolveChunkProcessor(
             trackFirstSeen: false,
-            useDateCache: $this->shouldUseDateCache(),
+            useDateCache: $useDateCache,
             useByteCounts: $useByteCounts,
         );
         $uriCount = count(self::$uris);
@@ -1417,7 +1785,10 @@ final class Parser
 
         fclose($handle);
 
-        return $counts;
+        return [
+            'counts' => $counts,
+            'active_days' => self::buildActiveDayBitmapFromParsedDateCache($parsedDateCache, $useDateCache),
+        ];
     }
 
 
@@ -1566,12 +1937,13 @@ final class Parser
     private function buildOutputFromWordCounts(string $counts, array $orderedUris): string
     {
         $outputDayPrefixes = self::$outputDayPrefixes;
-        $outputDaySlots = self::$outputDaySlots;
+        $outputWordOffsets = self::$outputWordOffsets;
         $outputDayCount = count($outputDayPrefixes);
         $useDayMajorLayout = self::$useDayMajorLayout;
         $uriCount = count(self::$uris);
         $slotStride = $useDayMajorLayout ? ($uriCount << 1) : 2;
         $buffer = "{\n";
+        $numberCache = [];
         $uriTotal = count($orderedUris);
 
         foreach ($orderedUris as $uriOffset => $uriIndex) {
@@ -1590,17 +1962,18 @@ final class Parser
                             $buffer .= ",\n";
                         }
 
-                        $buffer .= $outputDayPrefixes[$dayIndex] . ($lowByte | ($highByte << 8));
+                        $count = $lowByte | ($highByte << 8);
+                        $buffer .= $outputDayPrefixes[$dayIndex] . ($numberCache[$count] ??= (string) $count);
                         $hasVisit = true;
                     }
 
                     $slot += $slotStride;
                 }
             } else {
-                $slotBase = $uriIndex * self::$activeDayCount;
+                $slotBase = ($uriIndex * self::$activeDayCount) << 1;
 
                 for ($dayIndex = 0; $dayIndex < $outputDayCount; $dayIndex++) {
-                    $slot = ($slotBase + $outputDaySlots[$dayIndex]) << 1;
+                    $slot = $slotBase + $outputWordOffsets[$dayIndex];
                     $lowByte = ord($counts[$slot]);
                     $highByte = ord($counts[$slot + 1]);
 
@@ -1609,7 +1982,8 @@ final class Parser
                             $buffer .= ",\n";
                         }
 
-                        $buffer .= $outputDayPrefixes[$dayIndex] . ($lowByte | ($highByte << 8));
+                        $count = $lowByte | ($highByte << 8);
+                        $buffer .= $outputDayPrefixes[$dayIndex] . ($numberCache[$count] ??= (string) $count);
                         $hasVisit = true;
                     }
                 }
@@ -1650,7 +2024,7 @@ final class Parser
         fclose($handle);
     }
 
-    private function writeWorkerCounts(string $path, array|string $counts): void
+    private function writeWorkerCounts(string $path, string $counts, string $activeDayBitmap): void
     {
         $handle = fopen($path, 'wb');
 
@@ -1658,7 +2032,7 @@ final class Parser
             throw new RuntimeException("Unable to open {$path}");
         }
 
-        $this->writeWorkerCountsStream($handle, $counts);
+        $this->writeWorkerCountsStream($handle, $counts, $activeDayBitmap);
 
         fclose($handle);
     }
@@ -1668,14 +2042,9 @@ final class Parser
         $this->writeEncodedWorkerResult($stream, $counts, $firstSeen);
     }
 
-    private function writeWorkerCountsStream($stream, array|string $counts): void
+    private function writeWorkerCountsStream($stream, string $counts, string $activeDayBitmap): void
     {
-        if ($this->shouldUseIgbinary()) {
-            $this->writeAll($stream, igbinary_serialize($counts));
-
-            return;
-        }
-
+        $this->writeAll($stream, $activeDayBitmap);
         $this->writeAll($stream, $counts);
     }
 
@@ -1731,19 +2100,18 @@ final class Parser
         return $this->decodeWorkerResult($raw, $slotCount, $uriCount, $rawCounts, $useByteCounts);
     }
 
-    private function readWorkerCounts(
-        string $path,
-        int $slotCount,
-        bool $rawCounts = false,
-        bool $useByteCounts = false,
-    ): array|string {
+    /**
+     * @return array{counts:string,active_days:string}
+     */
+    private function readWorkerCounts(string $path, int $slotCount, bool $useByteCounts): array
+    {
         $raw = file_get_contents($path);
 
         if ($raw === false) {
             throw new RuntimeException("Unable to read {$path}");
         }
 
-        return $this->decodeWorkerCounts($raw, $slotCount, $rawCounts, $useByteCounts);
+        return $this->decodeWorkerCounts($raw, $slotCount, $useByteCounts);
     }
 
     private function decodeWorkerResult(
@@ -1786,27 +2154,22 @@ final class Parser
         return [$counts, $firstSeen];
     }
 
-    private function decodeWorkerCounts(
-        string $raw,
-        int $slotCount,
-        bool $rawCounts = false,
-        bool $useByteCounts = false,
-    ): array|string {
-        if ($this->shouldUseIgbinary()) {
-            $counts = igbinary_unserialize($raw);
+    /**
+     * @return array{counts:string,active_days:string}
+     */
+    private function decodeWorkerCounts(string $raw, int $slotCount, bool $useByteCounts): array
+    {
+        $countsSize = $useByteCounts ? $slotCount : $slotCount * 2;
+        $expectedSize = self::ACTIVE_DAY_BITMAP_SIZE + $countsSize;
 
-            if (! $rawCounts && is_string($counts)) {
-                $counts = array_values(unpack($useByteCounts ? 'C*' : 'v*', $counts));
-            }
-
-            return $counts;
+        if (strlen($raw) !== $expectedSize) {
+            throw new RuntimeException('Unable to decode worker payload');
         }
 
-        if (! $rawCounts) {
-            return array_values(unpack($useByteCounts ? 'C*' : 'v*', $raw));
-        }
-
-        return $raw;
+        return [
+            'active_days' => substr($raw, 0, self::ACTIVE_DAY_BITMAP_SIZE),
+            'counts' => substr($raw, self::ACTIVE_DAY_BITMAP_SIZE, $countsSize),
+        ];
     }
 
     private function mergeWorkerResult(
@@ -1922,9 +2285,9 @@ final class Parser
         throw new RuntimeException('Unable to allocate worker shared memory');
     }
 
-    private function writeWorkerShmopCounts($handle, int $payloadSize, string $counts): void
+    private function writeWorkerShmopCounts($handle, int $payloadSize, string $counts, string $activeDayBitmap): void
     {
-        $written = shmop_write($handle, $counts, 0);
+        $written = shmop_write($handle, $activeDayBitmap . $counts, 0);
 
         if ($written !== $payloadSize) {
             throw new RuntimeException('Unable to write worker shared memory payload');
@@ -1965,11 +2328,7 @@ final class Parser
 
     private function resolveWorkerCountsPayloadSize(int $slotCount, bool $useByteCounts): int
     {
-        if ($this->shouldUseIgbinary()) {
-            return ($useByteCounts ? $slotCount : $slotCount * 2) + 4096;
-        }
-
-        return $useByteCounts ? $slotCount : $slotCount * 2;
+        return self::ACTIVE_DAY_BITMAP_SIZE + ($useByteCounts ? $slotCount : $slotCount * 2);
     }
 
     private function tuneWorkerSocketStream($stream, int $payloadSize, int $option): void
@@ -2018,12 +2377,16 @@ final class Parser
 
     private function shouldUseCompactDayDomain(): bool
     {
-        return getenv('PARSER_USE_COMPACT_DAYS') !== false;
+        $override = getenv('PARSER_USE_COMPACT_DAYS');
+
+        return $override !== false && $override !== '0';
     }
 
     private function shouldUseBandedDayDomain(): bool
     {
-        return getenv('PARSER_USE_BANDED_DAYS') !== false;
+        $override = getenv('PARSER_USE_BANDED_DAYS');
+
+        return $override !== false && $override !== '0';
     }
 
     private static function shouldUseIntegerDateCache(): bool
@@ -2114,7 +2477,13 @@ final class Parser
 
     private function shouldUseByteCounts(int $workerCount): bool
     {
-        return $workerCount >= 4 && getenv('PARSER_DISABLE_BYTE_COUNTS') === false;
+        if ($workerCount < 4) {
+            return false;
+        }
+
+        $override = getenv('PARSER_USE_BYTE_COUNTS');
+
+        return $override !== false && $override !== '0';
     }
 
     private function shouldUseSocketTransport(): bool
@@ -2126,10 +2495,10 @@ final class Parser
 
     private function shouldUseShmopTransport(): bool
     {
-        $override = getenv('PARSER_USE_SHMOP_TRANSPORT');
+        $enable = getenv('PARSER_USE_SHMOP_TRANSPORT');
 
-        return $override !== false
-            && $override !== '0'
+        return $enable !== false
+            && $enable !== '0'
             && function_exists('shmop_open')
             && function_exists('shmop_read')
             && function_exists('shmop_write')
@@ -2140,6 +2509,11 @@ final class Parser
     private function shouldProfile(): bool
     {
         return getenv('PARSER_PROFILE') !== false;
+    }
+
+    private function shouldInternalProfile(): bool
+    {
+        return getenv('PARSER_PROFILE_INTERNAL') !== false;
     }
 
 }
